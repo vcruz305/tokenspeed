@@ -189,10 +189,10 @@ class TestGrammarTpLockstep(unittest.TestCase):
         self.assertEqual(len(manager.get_ready_grammar_requests()), 1)
         self.assertIsNone(state.grammar)
         self.assertIn("timed out", state.finished_reason.to_json()["message"])
-        # This rank's compiled grammar stays cached.
-        value, hit = manager.grammar_backend.get_cached_or_future_value(KEY)
-        self.assertTrue(hit)
-        self.assertFalse(value.is_invalid)
+        # No request was admitted with this rank's compiled grammar, so it is
+        # not kept.
+        _, hit = manager.grammar_backend.get_cached_or_future_value(KEY)
+        self.assertFalse(hit)
 
 
 class TestGrammarTpOutcome(unittest.TestCase):
