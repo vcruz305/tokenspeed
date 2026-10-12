@@ -345,7 +345,7 @@ def _moe(
         num_warps=num_warps,
         num_stages=3,
     )
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, None, 0)
     return output
 
 

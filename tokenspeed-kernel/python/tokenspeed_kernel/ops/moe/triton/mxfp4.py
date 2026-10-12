@@ -787,7 +787,7 @@ def _moe(
         num_stages=3,
         **backend_options,
     )
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, None, 0)
     return output
 
 
