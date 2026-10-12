@@ -26,13 +26,14 @@ Serves checkpoints whose experts quantize activations to MXFP4 at runtime
 
 Pipeline (all launches on the caller's stream, no host synchronization):
 
-1. ``gluon_moe_sorting`` groups routes by expert into ``BLOCK_M`` blocks.
-2. ``..._quant`` quantizes the BF16 tokens to MXFP4.
-3. ``..._stage1`` gathers each block's tokens, runs the gate/up GEMM, applies
+1. ``..._prep`` quantizes the BF16 tokens to MXFP4. For decode-sized route
+   sets one extra program groups routes by expert into ``BLOCK_M`` blocks;
+   larger sets use ``gluon_moe_sorting`` before it.
+2. ``..._stage1`` gathers each block's tokens, runs the gate/up GEMM, applies
    ``SiLU(gate) * up`` and requantizes the intermediate to MXFP4 in
    sorted-route order.
-4. ``..._stage2`` runs the down GEMM and writes BF16 per-route outputs.
-5. ``..._combine`` reduces each token's routes in FP32 top-k slot order.
+3. ``..._stage2`` runs the down GEMM and writes BF16 per-route outputs.
+4. ``..._combine`` reduces each token's routes in FP32 top-k slot order.
 
 Numerics match the portable Triton path: per-32 E8M0 scale
 ``2**ceil(log2(amax / 6))`` with round-to-nearest-even E2M1, gate and up
@@ -55,6 +56,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sor
 _MXFP4_BLOCK = gl.constexpr(32)
 # gfx950 (MI350/MI355) dispatches workgroups round-robin over 8 XCDs.
 _NUM_XCDS = 8
+# Route sets up to this size are sorted inside the quantization launch.
+_FUSED_SORT_MAX_ROUTES = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -194,27 +197,120 @@ def _xcd_local_pid(NUM_XCDS: gl.constexpr):
 # ---------------------------------------------------------------------------
 
 
-def _quant_launch_metadata(grid, kernel, args):
+@gluon.jit
+def _sort_routes_one_program(
+    topk_ids_ptr,
+    sorted_ids_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    cursor_ptr,
+    M,
+    E: gl.constexpr,
+    TOP_K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    ROUTE_BLOCK: gl.constexpr,
+    EXPERT_PAD: gl.constexpr,
+):
+    """Block-aligned expert sort of up to ``ROUTE_BLOCK`` routes in one program.
+
+    Same output contract as ``gluon_moe_sorting`` (padding id
+    ``(TOP_K << 24) | M``), except that routes of one expert keep no
+    particular order, which no consumer depends on.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    route = gl.arange(0, ROUTE_BLOCK, layout=layout)
+    valid = route < M * TOP_K
+    expert_id = gl.load(topk_ids_ptr + route, mask=valid, other=E).to(gl.int32)
+    valid &= (expert_id >= 0) & (expert_id < E)
+    expert_id = gl.where(valid, expert_id, E)
+    count = gl.histogram(expert_id, EXPERT_PAD, mask=valid, layout=layout)
+    count = count.to(gl.int32)
+    expert = gl.arange(0, EXPERT_PAD, layout=layout)
+    count = gl.where(expert < E, count, 0)
+    padded = (count + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    end = gl.cumsum(padded, 0)
+    start = end - padded
+    gl.store(num_valid_ids_ptr, gl.sum(padded, 0))
+    gl.store(num_valid_ids_ptr + 1, M)
+    gl.store(cursor_ptr + expert, start, mask=expert < E)
+    for j in range(0, gl.max(padded, 0) // BLOCK_M):
+        gl.store(
+            sorted_expert_ids_ptr + start // BLOCK_M + j,
+            expert,
+            mask=j * BLOCK_M < padded,
+        )
+    for j in gl.static_range(BLOCK_M):
+        slot = start + count + j
+        gl.store(sorted_ids_ptr + slot, (TOP_K << 24) | M, mask=slot < end)
+    # The cursors must be in place before any wave claims a slot.
+    gl.barrier()
+    slot = gl.atomic_add(
+        cursor_ptr + expert_id,
+        gl.full([ROUTE_BLOCK], 1, gl.int32, layout=layout),
+        mask=valid,
+        sem="relaxed",
+        scope="gpu",
+    )
+    gl.store(
+        sorted_ids_ptr + slot, ((route % TOP_K) << 24) | (route // TOP_K), mask=valid
+    )
+
+
+def _prep_launch_metadata(grid, kernel, args):
     m = args["M"]
     k = args["K"]
     return {"name": kernel.name, "bytes": m * k * 2 + m * (k // 2 + k // 32)}
 
 
-@gluon.jit(launch_metadata=_quant_launch_metadata, do_not_specialize=("M",))
-def gluon_mxfp4_a4w4_moe_apply_quant_gfx950(
+@gluon.jit(launch_metadata=_prep_launch_metadata, do_not_specialize=("M",))
+def gluon_mxfp4_a4w4_moe_apply_prep_gfx950(
     x_ptr,
     xq_ptr,
     xs_ptr,
+    topk_ids_ptr,
+    sorted_ids_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    cursor_ptr,
     M,
     stride_xm,
     K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    FUSE_SORT: gl.constexpr,
+    E: gl.constexpr,
+    TOP_K: gl.constexpr,
+    SORT_BLOCK_M: gl.constexpr,
+    ROUTE_BLOCK: gl.constexpr,
+    EXPERT_PAD: gl.constexpr,
 ):
-    """Quantize BF16 rows ``[M, K]`` to packed E2M1 and quad-major scales."""
+    """Quantize BF16 rows ``[M, K]`` to packed E2M1 and quad-major scales.
+
+    With ``FUSE_SORT`` the last program instead sorts the routes into
+    ``SORT_BLOCK_M`` expert blocks, saving decode two launches.
+    """
+    pid = gl.program_id(0)
+    if FUSE_SORT:
+        if pid == gl.num_programs(0) - 1:
+            _sort_routes_one_program(
+                topk_ids_ptr,
+                sorted_ids_ptr,
+                sorted_expert_ids_ptr,
+                num_valid_ids_ptr,
+                cursor_ptr,
+                M,
+                E,
+                TOP_K,
+                SORT_BLOCK_M,
+                ROUTE_BLOCK,
+                EXPERT_PAD,
+            )
+            return
+    pid_m = pid // (K // BLOCK_K)
+    pid_k = pid % (K // BLOCK_K)
     layout: gl.constexpr = _downcast_layout(BLOCK_M, BLOCK_K, gl.num_warps())
-    rows = gl.program_id(0) * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
-    cols = gl.program_id(1) * BLOCK_K + gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
+    rows = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    cols = pid_k * BLOCK_K + gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
     vals = gl.load(
         x_ptr + rows[:, None].to(gl.int64) * stride_xm + cols[None, :],
         mask=rows[:, None] < M,
@@ -226,8 +322,8 @@ def gluon_mxfp4_a4w4_moe_apply_quant_gfx950(
         scale,
         xq_ptr,
         xs_ptr,
-        gl.program_id(0) * BLOCK_M,
-        gl.program_id(1) * BLOCK_K,
+        pid_m * BLOCK_M,
+        pid_k * BLOCK_K,
         M,
         K // 2,
         K // _MXFP4_BLOCK,
@@ -878,39 +974,65 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
     out = torch.empty((num_tokens, hidden), dtype=x.dtype, device=device)
     if num_tokens == 0:
         return out
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.to(torch.float32).contiguous()
     num_routes = num_tokens * top_k
     cfg = _select_config(num_routes, num_experts)
-
-    sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = gluon_moe_sorting(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        hidden,
-        x.dtype,
-        cfg.block_m,
-        compact_route_programs=num_routes <= 1024,
-        out=out,
-    )
-    padded_rows = int(sorted_ids.shape[0])
-    num_blocks = triton.cdiv(padded_rows, cfg.block_m)
 
     xq = torch.empty((num_tokens, hidden // 2), dtype=torch.uint8, device=device)
     xs = torch.empty((num_tokens, hidden // 32), dtype=torch.uint8, device=device)
     quant_block_m = 16
     quant_block_k = 512
-    gluon_mxfp4_a4w4_moe_apply_quant_gfx950[
-        (triton.cdiv(num_tokens, quant_block_m), hidden // quant_block_k)
-    ](
+    quant_programs = triton.cdiv(num_tokens, quant_block_m) * (hidden // quant_block_k)
+    # Decode-sized route sets are sorted by one extra program of the
+    # quantization launch.
+    fuse_sort = num_routes <= _FUSED_SORT_MAX_ROUTES
+    if fuse_sort:
+        padded_rows = (
+            (num_routes + min(num_routes, num_experts) * (cfg.block_m - 1))
+            // cfg.block_m
+            * cfg.block_m
+        )
+        sorted_ids = torch.empty((padded_rows,), dtype=torch.int32, device=device)
+        sorted_expert_ids = torch.empty(
+            (triton.cdiv(padded_rows, cfg.block_m),), dtype=torch.int32, device=device
+        )
+        num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
+        cursor = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    else:
+        sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = gluon_moe_sorting(
+            topk_ids.to(torch.int32).contiguous(),
+            topk_weights,
+            num_experts,
+            hidden,
+            x.dtype,
+            cfg.block_m,
+            compact_route_programs=False,
+            out=out,
+        )
+        padded_rows = int(sorted_ids.shape[0])
+        cursor = num_valid_ids
+    num_blocks = triton.cdiv(padded_rows, cfg.block_m)
+    gluon_mxfp4_a4w4_moe_apply_prep_gfx950[(quant_programs + int(fuse_sort),)](
         x,
         xq,
         xs,
+        topk_ids,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        cursor,
         num_tokens,
         x.stride(0),
         K=hidden,
         BLOCK_M=quant_block_m,
         BLOCK_K=quant_block_k,
+        FUSE_SORT=fuse_sort,
+        E=num_experts,
+        TOP_K=top_k,
+        SORT_BLOCK_M=cfg.block_m,
+        ROUTE_BLOCK=_FUSED_SORT_MAX_ROUTES,
+        EXPERT_PAD=triton.next_power_of_2(num_experts + 1),
         num_warps=4,
     )
 

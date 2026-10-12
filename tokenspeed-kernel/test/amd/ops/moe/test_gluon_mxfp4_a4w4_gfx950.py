@@ -182,7 +182,8 @@ def test_out_of_range_expert_contributes_zero() -> None:
     w = _weights()
     moe_process_weights(_plan(None), w)
     x, topk_weights, topk_ids = _routes(4)
-    dropped = topk_ids.clone()
+    # int64 ids are read directly.
+    dropped = topk_ids.clone().long()
     dropped[:, -1] = EXPERTS
     actual = a4w4_moe.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
         x,
@@ -243,7 +244,7 @@ def test_decode_batch_sizes_do_not_recompile() -> None:
     w = _weights()
     moe_process_weights(_plan(None), w)
     kernels = (
-        a4w4_moe.gluon_mxfp4_a4w4_moe_apply_quant_gfx950,
+        a4w4_moe.gluon_mxfp4_a4w4_moe_apply_prep_gfx950,
         a4w4_moe.gluon_mxfp4_a4w4_moe_apply_stage1_gfx950,
         a4w4_moe.gluon_mxfp4_a4w4_moe_apply_stage2_gfx950,
         a4w4_moe.gluon_mxfp4_a4w4_moe_apply_combine_gfx950,
@@ -268,3 +269,32 @@ def test_decode_batch_sizes_do_not_recompile() -> None:
         for m in (2, 3, 7, 16, 17, 32):
             run(m)
     torch.cuda.synchronize()
+
+
+def test_cuda_graph_replay_matches_eager() -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    x, topk_weights, topk_ids = _routes(8)
+
+    def run():
+        return a4w4_moe.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    new_x, new_weights, new_ids = _routes(8, seed=7)
+    x.copy_(new_x)
+    topk_weights.copy_(new_weights)
+    topk_ids.copy_(new_ids)
+    graph.replay()
+    torch.testing.assert_close(out, run(), atol=0, rtol=0)
