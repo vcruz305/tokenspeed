@@ -240,7 +240,7 @@ def test_bank_layout_round_trip_and_loader() -> None:
     assert loaded == ["w"] * 4
 
 
-def test_decode_batch_sizes_do_not_recompile() -> None:
+def test_batch_sizes_do_not_recompile() -> None:
     w = _weights()
     moe_process_weights(_plan(None), w)
     kernels = (
@@ -262,11 +262,14 @@ def test_decode_batch_sizes_do_not_recompile() -> None:
             topk_ids,
         )
 
-    # Every decode width (routes <= 4 per expert) shares one specialization;
-    # the row count is a runtime argument in every kernel.
+    # Every decode width (routes <= 4 per expert, sorted in the prep launch
+    # with a power-of-two route bound) shares one specialization, and so does
+    # every width of the 64-row prefill blocks; the row count is a runtime
+    # argument in every kernel.
     run(1)
+    run(400)
     with assert_no_triton_compile(*kernels):
-        for m in (2, 3, 7, 16, 17, 32):
+        for m in (2, 3, 7, 16, 17, 32, 401, 517, 1000):
             run(m)
     torch.cuda.synchronize()
 

@@ -1031,7 +1031,11 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
         E=num_experts,
         TOP_K=top_k,
         SORT_BLOCK_M=cfg.block_m,
-        ROUTE_BLOCK=_FUSED_SORT_MAX_ROUTES,
+        ROUTE_BLOCK=(
+            max(256, triton.next_power_of_2(num_routes))
+            if fuse_sort
+            else _FUSED_SORT_MAX_ROUTES
+        ),
         EXPERT_PAD=triton.next_power_of_2(num_experts + 1),
         num_warps=4,
     )
