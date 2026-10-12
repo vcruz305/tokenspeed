@@ -34,6 +34,7 @@ import tokenspeed_kernel.ops.gemm.gluon_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
 import tokenspeed_kernel.ops.gemm.torch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
+import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
@@ -64,7 +65,7 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import Platform, pdl_enabled
+from tokenspeed_kernel.platform import Platform, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
@@ -563,6 +564,12 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     }
 )
 
+# Up to this many 16-bit rows, ``quant="fp8"`` without ``A_scales`` quantizes
+# them per token with the one-launch Triton quantizer (``fp8_quantize_per_token``,
+# about a quarter of TRT-LLM's launch on GB200 at decode rows); above it with
+# the registered token quantizer (TRT-LLM's on NVIDIA arch 10).
+_TRITON_TOKEN_FP8_MAX_M = 64
+
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
@@ -636,6 +643,14 @@ def _gemm_format_signature(
             b=tensor_format("mxfp8", B.dtype, scale=b_scale),
         )
     if quant == "fp8":
+        if A_scales is None and A.dtype != _fp8_dtype and B_scales is not None:
+            # Online per-token quantization (see mm): the kernel receives FP8
+            # activations with FP32 per-token scales, or quantizes them itself.
+            scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+            return format_signature(
+                a=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
+                b=tensor_format("scaled-fp8", B.dtype, scale=scale),
+            )
         scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity=_infer_scale_type(A_scales, B_scales) or "unknown",
@@ -764,7 +779,10 @@ def mm(
     Args:
         A: Activation matrix ``[M, K]``.
         B: Weight matrix.
-        A_scales: Activation scales.
+        A_scales: Activation scales. With ``quant="fp8"``, None for BF16/FP16
+            ``A`` quantizes it per token here before the call (FP8 E4M3, one
+            FP32 scale per row; on NVIDIA up to 64 rows by the Triton
+            quantizer, otherwise by the registered token quantizer).
         B_scales: Weight scales (layout depends on quant type).
         bias: Optional bias vector of shape ``[N]`` added to the
             output.  When the selected kernel supports a fused bias
@@ -925,6 +943,22 @@ def mm(
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
             enable_pdl=enable_pdl,
         )
+
+    # Online per-token FP8 quantization of 16-bit activations.
+    if (
+        quant == "fp8"
+        and A_scales is None
+        and A.dtype != _fp8_dtype
+        and B_scales is not None
+    ):
+        if M <= _TRITON_TOKEN_FP8_MAX_M and current_platform().is_nvidia:
+            from tokenspeed_kernel.ops.quantization.triton import (
+                fp8_quantize_per_token,
+            )
+
+            A, A_scales = fp8_quantize_per_token(A)
+        else:
+            A, A_scales = quantize_fp8(A, granularity="token")
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
