@@ -34,6 +34,7 @@ owns only a sparse subset of the routed experts.
 | `__init__.py` | Package exports: the stage invokers, the top-k route entries, the prefill weight aliases, and the scale gather. |
 | `prefill_stage1.py` / `prefill_stage2.py` | Block-ragged MXFP4/MXFP8-activation, MXFP4-weight prefill GEMMs (gdot128-preshuffled weights). |
 | `decode_stage1.py` / `decode_stage2.py` | A4W4 direct-MFMA decode kernels plus their invokers: stage 1 fuses SwiGLU, stage 2 fuses the routed-weight top-k combine. |
+| `a4w4_moe.py` | Dynamic-MXFP4-activation SiLU experts on N16 weight banks: activation quantization, gate/up GEMM with fused SiLU-and-mul and MXFP4 requantization, down GEMM, slot-order combine (all batch sizes). |
 | `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`, and the compact scaled-upcast scale tile `situ_decode.py` reuses. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
