@@ -31,27 +31,47 @@ _LOAD_ELEMS = gl.constexpr(2)
 
 
 @gluon.jit
-def _load_candidate(
-    prefix,
+def _load_snapshot(
     block_residual,
+    candidate,
+    stride_block_n,
     token,
+    stride_block_t: gl.constexpr,
     hidden,
     hidden_mask,
-    stride_block_t: gl.constexpr,
-    stride_block_n: tl.int64,
-    candidate: gl.constexpr,
-    N: gl.constexpr,
 ):
-    if candidate == N - 1:
-        return prefix
     # The stride fits int32, but candidate * stride can exceed it at large T.
-    ptr = block_residual + candidate * stride_block_n.to(gl.int64)
     return cdna5.buffer_load(
-        ptr,
+        block_residual + candidate * stride_block_n.to(gl.int64),
         (token * stride_block_t + hidden).to(gl.int32),
         mask=hidden_mask,
         other=0.0,
     ).to(gl.float32)
+
+
+@gluon.jit
+def _attn_res_accumulate(
+    value,
+    scorer,
+    max_logit,
+    denominator,
+    mixed,
+    H: gl.constexpr,
+    SCORE_EPS: gl.constexpr,
+):
+    """Fold one candidate into a normalized online softmax mixture."""
+    square_sum = gl.sum(value * value, axis=0)
+    dot = gl.sum(value * scorer, axis=0)
+    score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+    score_delta = score - max_logit
+    relative_scale = gl.exp2(-gl.abs(score_delta) * 1.4426950408889634)
+    candidate_is_max = score_delta > 0.0
+    old_scale = gl.where(candidate_is_max, relative_scale, 1.0)
+    candidate_scale = gl.where(candidate_is_max, 1.0, relative_scale)
+    denominator = denominator * old_scale + candidate_scale
+    candidate_weight = candidate_scale / denominator
+    mixed += candidate_weight * (value - mixed)
+    return gl.maximum(max_logit, score), denominator, mixed
 
 
 @gluon.jit
@@ -76,6 +96,7 @@ def gluon_attn_res_fwd_gfx1250(
     SCORE_EPS: gl.constexpr,
     OUTPUT_EPS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    UNROLL: gl.constexpr,
 ):
     token = gl.program_id(0)
     hidden_layout: gl.constexpr = gl.BlockedLayout(
@@ -128,31 +149,43 @@ def gluon_attn_res_fwd_gfx1250(
             mask=hidden_mask,
             other=0.0,
         ).to(gl.float32)
-        max_logit = -float("inf")
-        denominator = 0.0
-        mixed = gl.zeros([_BLOCK_H], gl.float32, hidden_layout)
-        for candidate in gl.static_range(N):
-            value = _load_candidate(
-                prefix,
-                block_residual,
-                token,
-                hidden,
-                hidden_mask,
-                stride_block_t,
-                stride_block_n,
-                candidate,
-                N,
-            )
-            square_sum = gl.sum(value * value, axis=0)
-            dot = gl.sum(value * scorer, axis=0)
-            score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
-            next_max = gl.maximum(max_logit, score)
-            old_scale = gl.exp(max_logit - next_max)
-            candidate_scale = gl.exp(score - next_max)
-            denominator = denominator * old_scale + candidate_scale
-            mixed = mixed * old_scale + candidate_scale * value
-            max_logit = next_max
-        mixed /= denominator
+        # Consume the resident prefix first so it becomes the running mixture.
+        mixed = prefix
+        square_sum = gl.sum(prefix * prefix, axis=0)
+        dot = gl.sum(prefix * scorer, axis=0)
+        max_logit = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+        denominator = 1.0
+        # Unrolling lets the compiler hoist every snapshot load. That hides
+        # load latency on short decode grids but cuts occupancy on long ones,
+        # where a runtime loop keeps one snapshot live at a time.
+        if UNROLL:
+            for candidate in gl.static_range(N - 1):
+                value = _load_snapshot(
+                    block_residual,
+                    candidate,
+                    stride_block_n,
+                    token,
+                    stride_block_t,
+                    hidden,
+                    hidden_mask,
+                )
+                max_logit, denominator, mixed = _attn_res_accumulate(
+                    value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
+                )
+        else:
+            for candidate in range(N - 1):
+                value = _load_snapshot(
+                    block_residual,
+                    candidate,
+                    stride_block_n,
+                    token,
+                    stride_block_t,
+                    hidden,
+                    hidden_mask,
+                )
+                max_logit, denominator, mixed = _attn_res_accumulate(
+                    value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
+                )
 
     # Preserve the AttnRes BF16 boundary before output RMSNorm.
     mixed = mixed.to(gl.bfloat16).to(gl.float32)
@@ -225,8 +258,9 @@ def attn_res_rmsnorm_gfx1250(
         raise ValueError("gfx1250 AttnRes requires a contiguous hidden dimension")
 
     output = torch.empty_like(layer_residual)
-    # Use 8 warps and waves_per_eu=2 under 256 tokens with snapshots to mix.
-    # Larger grids and the no-snapshot case keep 4 warps and default waves.
+    # Use 8 warps, waves_per_eu=2 and an unrolled snapshot loop under 256
+    # tokens with snapshots to mix. Larger grids and the no-snapshot case keep
+    # 4 warps, default waves and a runtime loop.
     eight_warps = tokens < 256 and num_valid_blocks >= 1
     num_warps = 8 if eight_warps else 4
     delta_tensor = layer_residual if delta is None else delta
@@ -244,6 +278,7 @@ def attn_res_rmsnorm_gfx1250(
         "SCORE_EPS": score_eps,
         "OUTPUT_EPS": output_eps,
         "NUM_WARPS": num_warps,
+        "UNROLL": eight_warps,
         "num_warps": num_warps,
     }
     if eight_warps:

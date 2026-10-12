@@ -304,11 +304,13 @@ and stores BF16. The live row count and split-buffer stride are runtime
 arguments that do not specialize the producer or reduction, so warming a
 projection covers other batch sizes with the same model dimensions.
 
-The gfx1250 AttnRes launch has two fixed warp configurations: eight warps
-below 256 tokens when mixing snapshots, and four otherwise. Normal startup's
-prefill and decode warmups compile both before serving. Direct kernel callers
-must warm both token ranges; disabling startup warmups can defer compilation
-until the first call in an unwarmed range.
+The gfx1250 AttnRes kernel folds the resident prefix and then each snapshot
+into a normalized online softmax, as on gfx950. The launch has two fixed
+configurations: eight warps with an unrolled snapshot loop below 256 tokens
+when mixing snapshots, and four warps with a runtime loop otherwise. Normal
+startup's prefill and decode warmups compile both before serving. Direct
+kernel callers must warm both token ranges; disabling startup warmups can
+defer compilation until the first call in an unwarmed range.
 
 ### gfx1250 BF16 GEMM
 
