@@ -214,8 +214,32 @@ def write_prefill_conv_checkpoints(
     )
 
 
+@triton.jit
+def _pack_token_rows(
+    source,
+    packed,
+    source_token,
+    token,
+    live,
+    SOURCE_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    """Gather ``[BLOCK_T, WIDTH]`` token rows in ``BLOCK_F``-wide column tiles."""
+    present = live & (source_token >= 0)
+    source_rows = source + source_token.to(tl.int64)[:, None] * SOURCE_STRIDE
+    packed_rows = packed + token.to(tl.int64)[:, None] * WIDTH
+    for start in tl.static_range(0, WIDTH, BLOCK_F):
+        feature = start + tl.arange(0, BLOCK_F)
+        in_row = (feature < WIDTH)[None, :]
+        values = tl.load(
+            source_rows + feature[None, :], mask=present[:, None] & in_row, other=0
+        )
+        tl.store(packed_rows + feature[None, :], values, mask=live[:, None] & in_row)
+
+
 @triton.jit(
-    do_not_specialize=["num_tokens", "num_rows"],
+    do_not_specialize=["num_tokens", "token_programs"],
     do_not_specialize_on_alignment=["token_indices"],
 )
 def _pack_prefill_recurrent_inputs_kernel(
@@ -240,7 +264,7 @@ def _pack_prefill_recurrent_inputs_kernel(
     beta_raw,
     beta_raw_out,
     num_tokens,
-    num_rows,
+    token_programs,
     query_stride: tl.constexpr,
     key_stride: tl.constexpr,
     value_stride: tl.constexpr,
@@ -270,140 +294,74 @@ def _pack_prefill_recurrent_inputs_kernel(
     HAS_G: tl.constexpr,
     HAS_F_A: tl.constexpr,
     HAS_BETA: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+    STATE_BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    token = offsets // query_width
-    feature = offsets % query_width
-    mask = (token < num_tokens) & (feature < query_width)
-    source_token = tl.load(token_indices + token, mask=mask, other=0)
-    tl.store(
-        query_out + token * query_width + feature,
-        tl.load(
-            query + source_token * query_stride + feature,
-            mask=mask & (source_token >= 0),
-            other=0,
-        ),
-        mask=mask,
-    )
-
-    token = offsets // key_width
-    feature = offsets % key_width
-    mask = (token < num_tokens) & (feature < key_width)
-    source_token = tl.load(token_indices + token, mask=mask, other=0)
-    tl.store(
-        key_out + token * key_width + feature,
-        tl.load(
-            key + source_token * key_stride + feature,
-            mask=mask & (source_token >= 0),
-            other=0,
-        ),
-        mask=mask,
-    )
-
-    token = offsets // value_width
-    feature = offsets % value_width
-    mask = (token < num_tokens) & (feature < value_width)
-    source_token = tl.load(token_indices + token, mask=mask, other=0)
-    tl.store(
-        value_out + token * value_width + feature,
-        tl.load(
-            value + source_token * value_stride + feature,
-            mask=mask & (source_token >= 0),
-            other=0,
-        ),
-        mask=mask,
-    )
-
-    row = offsets // state_width
-    feature = offsets % state_width
-    mask = (row < num_rows) & (feature < state_width)
-    source_row = tl.load(rows + row, mask=mask, other=0)
-    dim_1_index = feature // (state_dim_2 * state_dim_3)
-    remainder = feature % (state_dim_2 * state_dim_3)
-    dim_2_index = remainder // state_dim_3
-    dim_3_index = remainder % state_dim_3
-    state_feature_offset = (
-        dim_1_index * state_stride_1
-        + dim_2_index * state_stride_2
-        + dim_3_index * state_stride_3
-    )
-    tl.store(
-        recurrent_state_out + row * state_width + feature,
-        tl.load(
-            recurrent_state + source_row * state_stride + state_feature_offset,
-            mask=mask,
-        ),
-        mask=mask,
-    )
-
-    if HAS_A:
-        token = offsets // a_width
-        feature = offsets % a_width
-        mask = (token < num_tokens) & (feature < a_width)
-        source_token = tl.load(token_indices + token, mask=mask, other=0)
-        tl.store(
-            a_out + token * a_width + feature,
-            tl.load(
-                a + source_token * a_stride + feature,
-                mask=mask & (source_token >= 0),
-                other=0,
-            ),
-            mask=mask,
+    """The first ``token_programs`` programs gather ``BLOCK_T`` token rows of
+    every token input each; the rest copy one ``STATE_BLOCK`` chunk of one
+    selected state row each. Token rows move in column tiles, so no
+    per-element division recovers the token and its loads stay vectorized."""
+    program = tl.program_id(0)
+    if program < token_programs:
+        token = program * BLOCK_T + tl.arange(0, BLOCK_T)
+        live = token < num_tokens
+        source_token = tl.load(token_indices + token, mask=live, other=-1)
+        _pack_token_rows(
+            query, query_out, source_token, token, live,
+            query_stride, query_width, BLOCK_F,
+        )  # fmt: skip
+        _pack_token_rows(
+            key, key_out, source_token, token, live, key_stride, key_width, BLOCK_F
         )
-    if HAS_B:
-        token = offsets // b_width
-        feature = offsets % b_width
-        mask = (token < num_tokens) & (feature < b_width)
-        source_token = tl.load(token_indices + token, mask=mask, other=0)
-        tl.store(
-            b_out + token * b_width + feature,
-            tl.load(
-                b + source_token * b_stride + feature,
-                mask=mask & (source_token >= 0),
-                other=0,
-            ),
-            mask=mask,
+        _pack_token_rows(
+            value, value_out, source_token, token, live,
+            value_stride, value_width, BLOCK_F,
+        )  # fmt: skip
+        if HAS_A:
+            _pack_token_rows(
+                a, a_out, source_token, token, live, a_stride, a_width, BLOCK_F
+            )
+        if HAS_B:
+            _pack_token_rows(
+                b, b_out, source_token, token, live, b_stride, b_width, BLOCK_F
+            )
+        if HAS_G:
+            _pack_token_rows(
+                g_raw, g_raw_out, source_token, token, live,
+                g_stride, g_width, BLOCK_F,
+            )  # fmt: skip
+        if HAS_F_A:
+            _pack_token_rows(
+                f_a_out, f_a_packed, source_token, token, live,
+                f_a_stride, f_a_width, BLOCK_F,
+            )  # fmt: skip
+        if HAS_BETA:
+            _pack_token_rows(
+                beta_raw, beta_raw_out, source_token, token, live,
+                beta_stride, beta_width, BLOCK_F,
+            )  # fmt: skip
+    else:
+        STATE_CHUNKS: tl.constexpr = (state_width + STATE_BLOCK - 1) // STATE_BLOCK
+        chunk = program - token_programs
+        row = chunk // STATE_CHUNKS
+        feature = (chunk % STATE_CHUNKS) * STATE_BLOCK + tl.arange(0, STATE_BLOCK)
+        mask = feature < state_width
+        source_row = tl.load(rows + row).to(tl.int64)
+        dim_1_index = feature // (state_dim_2 * state_dim_3)
+        remainder = feature % (state_dim_2 * state_dim_3)
+        dim_2_index = remainder // state_dim_3
+        dim_3_index = remainder % state_dim_3
+        state_feature_offset = (
+            dim_1_index * state_stride_1
+            + dim_2_index * state_stride_2
+            + dim_3_index * state_stride_3
         )
-    if HAS_G:
-        token = offsets // g_width
-        feature = offsets % g_width
-        mask = (token < num_tokens) & (feature < g_width)
-        source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
-            g_raw_out + token * g_width + feature,
+            recurrent_state_out + row.to(tl.int64) * state_width + feature,
             tl.load(
-                g_raw + source_token * g_stride + feature,
-                mask=mask & (source_token >= 0),
-                other=0,
-            ),
-            mask=mask,
-        )
-    if HAS_F_A:
-        token = offsets // f_a_width
-        feature = offsets % f_a_width
-        mask = (token < num_tokens) & (feature < f_a_width)
-        source_token = tl.load(token_indices + token, mask=mask, other=0)
-        tl.store(
-            f_a_packed + token * f_a_width + feature,
-            tl.load(
-                f_a_out + source_token * f_a_stride + feature,
-                mask=mask & (source_token >= 0),
-                other=0,
-            ),
-            mask=mask,
-        )
-    if HAS_BETA:
-        token = offsets // beta_width
-        feature = offsets % beta_width
-        mask = (token < num_tokens) & (feature < beta_width)
-        source_token = tl.load(token_indices + token, mask=mask, other=0)
-        tl.store(
-            beta_raw_out + token * beta_width + feature,
-            tl.load(
-                beta_raw + source_token * beta_stride + feature,
-                mask=mask & (source_token >= 0),
-                other=0,
+                recurrent_state + source_row * state_stride + state_feature_offset,
+                mask=mask,
             ),
             mask=mask,
         )
@@ -523,11 +481,25 @@ def pack_prefill_recurrent_checkpoint_inputs(
             for tensor in optional_inputs
         ),
     )
-    max_elements = max(
-        num_tokens * max(widths[0], widths[1], widths[2], *widths[4:]),
-        num_rows * widths[3],
-    )
-    block = 256
+    # Token rows move as [BLOCK_T, BLOCK_F] tiles; each selected state row
+    # splits into STATE_BLOCK chunks. Both program counts are runtime values.
+    block_t = 4
+    block_f = min(1024, triton.next_power_of_2(max(*widths[:3], *widths[4:])))
+    state_block = min(4096, triton.next_power_of_2(widths[3]))
+    token_programs = triton.cdiv(num_tokens, block_t)
+    state_programs = num_rows * triton.cdiv(widths[3], state_block)
+    if token_programs + state_programs == 0:
+        return PackedPrefillCheckpointInputs(
+            query=query_out,
+            key=key_out,
+            value=value_out,
+            recurrent_state=state_out,
+            a=optional_outputs[0],
+            b=optional_outputs[1],
+            g_raw=optional_outputs[2],
+            f_a_out=optional_outputs[3],
+            beta_raw=optional_outputs[4],
+        )
     dummy = query
     kernel_outputs = tuple(
         dummy if tensor is None else tensor for tensor in optional_outputs
@@ -535,7 +507,7 @@ def pack_prefill_recurrent_checkpoint_inputs(
     kernel_inputs = tuple(
         dummy if tensor is None else tensor for tensor in optional_inputs
     )
-    _pack_prefill_recurrent_inputs_kernel[(triton.cdiv(max_elements, block),)](
+    _pack_prefill_recurrent_inputs_kernel[(token_programs + state_programs,)](
         token_indices,
         rows,
         query,
@@ -557,7 +529,7 @@ def pack_prefill_recurrent_checkpoint_inputs(
         kernel_inputs[4],
         kernel_outputs[4],
         num_tokens,
-        num_rows,
+        token_programs,
         query_stride=strides[0],
         key_stride=strides[1],
         value_stride=strides[2],
@@ -587,7 +559,9 @@ def pack_prefill_recurrent_checkpoint_inputs(
         HAS_G=g_raw is not None,
         HAS_F_A=f_a_out is not None,
         HAS_BETA=beta_raw is not None,
-        BLOCK=block,
+        BLOCK_T=block_t,
+        BLOCK_F=block_f,
+        STATE_BLOCK=state_block,
     )
     return PackedPrefillCheckpointInputs(
         query=query_out,

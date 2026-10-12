@@ -126,7 +126,8 @@ def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
 
 
 def test_checkpoint_pack_compiles_once_across_token_slices():
-    """Body and tail index vectors are slices at any offset; that must not key a binary."""
+    """Body and tail index vectors are slices at any offset, and token and row
+    counts vary; none of that may key a binary."""
     from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
         _pack_prefill_recurrent_inputs_kernel,
     )
@@ -140,19 +141,22 @@ def test_checkpoint_pack_compiles_once_across_token_slices():
     gate = q.squeeze(0)
     order = torch.arange(40, device=device).flip(0)
 
-    def run(start, count):
+    def run(start, count, num_rows=2):
         indices = order[start : start + count]
         packed = pack_prefill_recurrent_checkpoint_inputs(
-            q, q, q, state, rows, indices, gate, gate, gate, gate, gate
+            q, q, q, state, rows[:num_rows], indices, gate, gate, gate, gate, gate
         )
         torch.testing.assert_close(
             packed.value.squeeze(0)[:count], gate[indices], rtol=0, atol=0
         )
+        torch.testing.assert_close(
+            packed.recurrent_state, state[rows[:num_rows]], rtol=0, atol=0
+        )
 
     run(0, 8)
     with assert_no_triton_compile(_pack_prefill_recurrent_inputs_kernel):
-        for start, count in ((1, 1), (3, 16), (0, 17), (5, 33)):
-            run(start, count)
+        for start, count, num_rows in ((1, 1, 1), (3, 16, 2), (0, 17, 1), (5, 33, 2)):
+            run(start, count, num_rows)
 
 
 @pytest.mark.parametrize("token_dim", [0, 1])
