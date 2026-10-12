@@ -1127,12 +1127,15 @@ standard SwiGLU) on gfx950. It replaces the portable Triton path there.
 
 #### Algorithm
 
-The block-aligned route sort is followed by four launches: activation
-quantization (scales stored lane-quad-major so a lane fetches four K steps'
-scales with one load), the gate/up GEMM with fused SiLU-and-mul and MXFP4
-requantization in sorted-route order, the down GEMM writing BF16 per-route
-rows, and the slot-order combine. Both GEMMs are `e2m1 x e2m1` scaled 16x16x128
-MFMAs that load weights straight into registers.
+Four launches: activation quantization (scales stored lane-quad-major so a
+lane fetches four K steps' scales with one load), the gate/up GEMM with fused
+SiLU-and-mul and MXFP4 requantization in sorted-route order, the down GEMM
+writing BF16 per-route rows, and the slot-order combine. Up to 1024 routes,
+one extra program of the quantization launch sorts the routes into expert
+blocks (atomic per-expert cursors; order within a block does not matter);
+larger route sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs
+are `e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
+registers.
 
 Block height follows the average routes per expert: 16 rows up to 4 routes
 per expert (decode, including the 64-row MTP verify batches), 32 rows up to
