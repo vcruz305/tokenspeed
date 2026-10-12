@@ -465,6 +465,7 @@ if current_platform().is_amd:
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.mhc import (
         launch_gluon_mhc_mixes_project_gfx1250,
+        launch_gluon_mhc_mixes_reduce_gfx1250,
         use_gluon_mhc_mixes_project_gfx1250,
     )
 
@@ -504,7 +505,7 @@ if current_platform().is_amd:
         hc_eps: float,
         sinkhorn_iters: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the hc=4 prenorm projection on GFX1250 WMMA for prefill batches."""
+        """Run the hc=4 prenorm projection and reduction on GFX1250 Gluon."""
         return _mhc_mixes_impl(
             residual,
             weight,
@@ -514,4 +515,5 @@ if current_platform().is_amd:
             hc_eps,
             sinkhorn_iters,
             _mhc_prenorm_gemm_gfx1250,
+            launch_gluon_mhc_mixes_reduce_gfx1250,
         )
