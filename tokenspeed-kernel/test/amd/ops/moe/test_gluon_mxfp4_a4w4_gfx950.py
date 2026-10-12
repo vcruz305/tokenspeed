@@ -110,11 +110,12 @@ def _dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _fake_quant(values: torch.Tensor) -> torch.Tensor:
-    """MXFP4 round trip: scale ``2**ceil(log2(amax / 6))``, E2M1 RNE."""
+    """MXFP4 round trip: Quark "even" scale, saturating E2M1 RNE."""
     groups = values.float().reshape(*values.shape[:-1], -1, 32)
     amax = groups.abs().amax(dim=-1, keepdim=True)
-    # amax = m * 2**e with m <= 1.5 takes exponent e - 2, otherwise e - 1.
-    exponent = ((amax.view(torch.int32) + 0x3FFFFF) >> 23) - 2
+    # amax = m * 2**e with m < 1.75 takes exponent e - 2, otherwise e - 1;
+    # scaled values above 6 saturate (they land past the last midpoint).
+    exponent = ((amax.view(torch.int32) + 0x200000) >> 23) - 2
     scale = torch.exp2(exponent.clamp(0, 254).float() - 127)
     scaled = groups.abs() / scale
     grid = torch.tensor(_E2M1[:8], device=values.device)

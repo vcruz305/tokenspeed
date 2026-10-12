@@ -1120,7 +1120,9 @@ standard SwiGLU) on gfx950. It replaces the portable Triton path there.
   groups and packs the gate/up scales of two 128-K steps into one 32-bit
   word. Wrapped `weight_loader`s keep checkpoint updates working.
 - Numerics follow the Triton path bit for bit up to FP32 accumulation order:
-  per-32 E8M0 scale `2**ceil(log2(amax / 6))`, E2M1 round-to-nearest-even,
+  per-32 E8M0 scale in Quark's "even" mode (amax rounded to a power of two,
+  minus E2M1's emax of 2, as the dense MXFP4 activation quantizer), saturating
+  E2M1 round-to-nearest-even,
   gate/up/SiLU/product rounded to BF16 before requantizing the intermediate,
   BF16 per-route outputs summed in FP32 slot order. Expert ids outside
   `[0, E)` contribute zero.

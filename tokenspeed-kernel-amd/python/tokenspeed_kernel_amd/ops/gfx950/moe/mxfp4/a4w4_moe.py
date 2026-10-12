@@ -36,7 +36,8 @@ Pipeline (all launches on the caller's stream, no host synchronization):
 4. ``..._combine`` reduces each token's routes in FP32 top-k slot order.
 
 Numerics match the portable Triton path: per-32 E8M0 scale
-``2**ceil(log2(amax / 6))`` with round-to-nearest-even E2M1, gate and up
+``2**(floor(log2(amax rounded to a power of two)) - 2)`` (the checkpoint's
+Quark "even" mode) with saturating round-to-nearest-even E2M1, gate and up
 rounded to BF16, ``SiLU(gate)`` rounded to BF16, the product rounded to BF16
 before requantization, and BF16 per-route outputs summed in FP32.
 
@@ -98,16 +99,16 @@ def _downcast_layout(block_m, block_n, num_warps):
 def _mxfp4_quantize(vals):
     """Quantize a ``[BM, BN]`` FP32 tile in ``_downcast_layout`` to MXFP4.
 
-    The E8M0 scale is ``2**ceil(log2(amax / 6))``: for BF16-representable
-    inputs that is exponent ``e - 2`` when ``amax = m * 2**e`` has ``m <= 1.5``
-    and ``e - 1`` otherwise, so no element exceeds E2M1's 6.0. The hardware
-    downcast rounds to nearest even.
+    Quark's "even" E8M0 scale, as the dense MXFP4 activation quantizer: for
+    ``amax = m * 2**e`` the exponent is ``e - 2`` when ``m < 1.75`` and
+    ``e - 1`` otherwise. Scaled values can reach just under 7; the hardware
+    downcast rounds to nearest even and saturates them to E2M1's 6.0.
     """
     BM: gl.constexpr = vals.shape[0]
     BN: gl.constexpr = vals.shape[1]
     groups = gl.abs(vals).reshape((BM, BN // _MXFP4_BLOCK, _MXFP4_BLOCK))
     amax = gl.max(groups, axis=2)
-    exponent = ((amax.to(gl.uint32, bitcast=True) + 0x3FFFFF) >> 23).to(gl.int32)
+    exponent = ((amax.to(gl.uint32, bitcast=True) + 0x200000) >> 23).to(gl.int32)
     scale = gl.minimum(gl.maximum(exponent - 2, 0), 254).to(gl.uint8)
     packed = gl.amd.cdna4.scaled_downcast(vals, scale, "e2m1", axis=1)
     return packed, scale
