@@ -85,3 +85,19 @@ def test_mmap_row_order_matches_normal_ple_shard_loader(tmp_path):
         )
         expected = lookup.ngram_embedding.weight[logical_id].view(torch.uint8).numpy()
         assert np.array_equal(mapped, expected)
+
+
+def test_qwen4_exp_runtime_module_imports():
+    import tokenspeed.runtime.models.qwen4_exp  # noqa: F401
+
+
+def test_missing_optional_mxfp4_kernels_fail_only_when_used():
+    from tokenspeed.runtime.layers.dense.mxfp4 import mxfp4_linear
+
+    try:
+        mxfp4_linear(None, None)
+    except ImportError as error:
+        assert "MXFP4 dense kernels are unavailable" in str(error)
+    else:
+        # A complete kernel installation may expose the optional API.
+        assert callable(mxfp4_linear)

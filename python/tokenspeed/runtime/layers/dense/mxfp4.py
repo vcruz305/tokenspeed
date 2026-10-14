@@ -20,11 +20,23 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.gemm import (
-    mxfp4_linear,
-    mxfp4_swiglu_linear,
-    prepare_mxfp4_linear,
-)
+try:
+    from tokenspeed_kernel.ops.gemm import (
+        mxfp4_linear,
+        mxfp4_swiglu_linear,
+        prepare_mxfp4_linear,
+    )
+except ImportError as error:
+    _MXFP4_IMPORT_ERROR = error
+
+    def _unavailable_mxfp4(*args, **kwargs):
+        raise ImportError(
+            "MXFP4 dense kernels are unavailable in the installed tokenspeed-kernel"
+        ) from _MXFP4_IMPORT_ERROR
+
+    mxfp4_linear = _unavailable_mxfp4
+    mxfp4_swiglu_linear = _unavailable_mxfp4
+    prepare_mxfp4_linear = _unavailable_mxfp4
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
