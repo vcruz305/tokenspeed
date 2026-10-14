@@ -225,6 +225,21 @@ class DistributedInitializer:
 
         gather_fabric_map()
 
+        from tokenspeed_kernel.platform import current_platform
+
+        mapping = config.mapping
+        if (
+            current_platform().is_cdna5
+            and mapping.nprocs_per_node
+            and mapping.world_size > mapping.nprocs_per_node
+        ):
+            # A gfx1250 Iris heap spanning hosts needs one fabric domain.
+            from tokenspeed_kernel.ops.communication.iris import (
+                discover_world_topology,
+            )
+
+            discover_world_topology()
+
         # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (

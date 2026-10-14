@@ -37,6 +37,8 @@ class TestAutoBackendTopology:
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._iris = Mock()
+        backend._iris.maps_across_hosts.return_value = False
+        backend._iris.heap_available.return_value = True
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
         backend._trtllm_ar.lamport_all_gather.return_value = None
@@ -217,6 +219,29 @@ class TestAutoBackendTopology:
 
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
         backend._iris.can_run.assert_not_called()
+
+    def test_a_heap_mapped_across_hosts_keeps_a_host_spread_all_reduce_on_iris(
+        self, backend, monkeypatch
+    ):
+        backend._iris.maps_across_hosts.return_value = True
+        monkeypatch.setattr(backend, "route", lambda *args: None)
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris-result"
+        tensor = torch.empty(1)
+
+        assert backend._all_reduce_one(tensor, tuple(range(8)), None) == "iris-result"
+        backend._nccl.all_reduce.assert_not_called()
+
+    def test_preparation_needs_a_heap_that_can_be_built(self, backend, monkeypatch):
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto, "current_platform", lambda: SimpleNamespace(is_amd=True)
+        )
+        group = (0, 1, 2, 3)
+        assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
+        backend._iris.heap_available.return_value = False
+        assert not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):

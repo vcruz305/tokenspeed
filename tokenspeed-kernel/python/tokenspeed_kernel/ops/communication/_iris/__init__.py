@@ -28,12 +28,40 @@ from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
 with redirect_triton_to_tokenspeed_triton():
     import iris
+    from iris.host.distributed.topology import TopologyDiscovery
 
 MIN_HEAP_BYTES = 256 << 20
 HEAP_HEADROOM_BYTES = 16 << 20
 _context = None
 _heap_size: int | None = None
 _allocator_type: str | None = None
+# (hosts, whether every rank shares one fabric domain), or None if not discovered.
+_world_topology: tuple[int, bool] | None = None
+
+
+def discover_world_topology() -> None:
+    """Gather every world rank's host and fabric domain; a world collective.
+
+    This is the discovery Iris validates a host-spanning heap against, so the
+    routing gates and the heap agree on whether it can be built.
+    """
+    global _world_topology
+    gpus = TopologyDiscovery().discover().gpu_info.values()
+    domains = {gpu.fabric_info.domain_key for gpu in gpus}
+    _world_topology = (
+        len({gpu.hostname for gpu in gpus}),
+        len(domains) == 1 and "" not in domains,
+    )
+
+
+def world_spans_hosts() -> bool:
+    """Whether the discovered world spans hosts; False if never discovered."""
+    return _world_topology is not None and _world_topology[0] > 1
+
+
+def world_shares_fabric_domain() -> bool:
+    """Whether the world spans hosts that all share one fabric domain."""
+    return world_spans_hosts() and _world_topology[1]
 
 
 def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:

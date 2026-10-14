@@ -21,8 +21,11 @@
 
 import math
 import socket
+import subprocess
+import sys
 import time
 import traceback
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -138,6 +141,60 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     monkeypatch.setattr(iris_ops, "_PRODUCER_TWO_SHOT_MIN_BYTES", {})
     assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    ("placement", "spans", "shared"),
+    [
+        ([("a", "p:1")] * 2, False, False),
+        ([("a", "p:1"), ("b", "p:1")], True, True),
+        ([("a", "p:1"), ("b", "p:2")], True, False),
+        ([("a", "p:1"), ("b", "")], True, False),
+    ],
+    ids=["one-host", "one-fabric-domain", "two-domains", "no-domain"],
+)
+def test_world_topology_comes_from_iris_discovery(
+    monkeypatch, placement, spans, shared
+):
+    from tokenspeed_kernel.ops.communication import _iris
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    gpus = {
+        rank: SimpleNamespace(
+            hostname=host, fabric_info=SimpleNamespace(domain_key=key)
+        )
+        for rank, (host, key) in enumerate(placement)
+    }
+    discovery = SimpleNamespace(discover=lambda: SimpleNamespace(gpu_info=gpus))
+    monkeypatch.setattr(_iris, "_world_topology", None)
+    monkeypatch.setattr(_iris, "TopologyDiscovery", lambda: discovery)
+    assert not iris_ops.world_spans_hosts()
+
+    iris_ops.discover_world_topology()
+    assert iris_ops.world_spans_hosts() is spans
+    assert iris_ops.world_shares_fabric_domain() is shared
+
+
+def test_world_topology_loads_iris_under_tokenspeed_triton():
+    """Iris kernels bind to whichever ``triton`` the first import of Iris sees.
+
+    The topology query is the first Iris use at distributed initialization. A
+    fresh interpreter is required: once this session imported Iris correctly,
+    the cached module hides an unredirected import.
+    """
+    script = """
+import sys
+from tokenspeed_kernel.ops.communication import iris as iris_ops
+assert "iris" not in sys.modules
+iris_ops.world_spans_hosts()
+import iris.mem.triton.ops as ops
+import tokenspeed_triton.runtime.jit as jit
+assert isinstance(ops.load, jit.JITFunction), type(ops.load).__module__
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------

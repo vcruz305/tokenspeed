@@ -233,6 +233,10 @@ class AutoBackend(CommBackend):
         nprocs_per_node = mapping.nprocs_per_node
         return len({rank // nprocs_per_node for rank in group}) > 1
 
+    def _spans_unmapped_nodes(self, group: Group) -> bool:
+        """``_group_spans_nodes``, unless the Iris heap maps across hosts."""
+        return self._group_spans_nodes(group) and not self._iris.maps_across_hosts()
+
     @staticmethod
     def _multicast_reachable(group: Group) -> bool:
         """Whether symmetric-memory multicast can map across ``group``.
@@ -362,7 +366,7 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
-            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
+            use_nccl = self._force_deterministic_rsag() or self._spans_unmapped_nodes(
                 group
             )
             if (
@@ -403,7 +407,7 @@ class AutoBackend(CommBackend):
         #   2. group spans nodes ................... NCCL
         #   3. Iris can run ........................ Iris
         #   4. otherwise ........................... NCCL
-        spans_nodes = self._group_spans_nodes(group)
+        spans_nodes = self._spans_unmapped_nodes(group)
         # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
         # armed for a group when that succeeded, so has_trtllm_ar() is itself
         # the "usable here" test. Checking it before the cross-node NCCL
@@ -428,7 +432,8 @@ class AutoBackend(CommBackend):
             or dtype != torch.bfloat16
             or self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or self._spans_unmapped_nodes(group)
+            or not self._iris.heap_available()
             or self._trtllm_ar.has_trtllm_ar(group)
         )
 
@@ -465,7 +470,7 @@ class AutoBackend(CommBackend):
         if (
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or self._spans_unmapped_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return False
@@ -486,7 +491,7 @@ class AutoBackend(CommBackend):
         if (
             self._force_deterministic_rsag()
             or self._batch_invariant_collectives()
-            or self._group_spans_nodes(group)
+            or self._spans_unmapped_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)

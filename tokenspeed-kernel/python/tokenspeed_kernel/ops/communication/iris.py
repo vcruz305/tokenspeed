@@ -63,6 +63,27 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
     configure(heap_size=heap_size, allocator_type=allocator_type)
 
 
+def discover_world_topology() -> None:
+    """Record every world rank's host and fabric domain; all ranks must call."""
+    from tokenspeed_kernel.ops.communication._iris import discover_world_topology
+
+    discover_world_topology()
+
+
+def world_spans_hosts() -> bool:
+    """Whether the discovered world spans hosts; False if never discovered."""
+    from tokenspeed_kernel.ops.communication._iris import world_spans_hosts
+
+    return world_spans_hosts()
+
+
+def world_shares_fabric_domain() -> bool:
+    """Whether the world spans hosts that all share one fabric domain."""
+    from tokenspeed_kernel.ops.communication._iris import world_shares_fabric_domain
+
+    return world_shares_fabric_domain()
+
+
 def producer_direct_all_reduce_can_run(
     world_size: int,
     total_numel: int,

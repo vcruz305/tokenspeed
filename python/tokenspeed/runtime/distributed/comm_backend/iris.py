@@ -59,6 +59,34 @@ class IrisBackend(CommBackend):
     def producer_direct_max_bytes(self) -> int:
         return self._producer_direct_max_bytes
 
+    @staticmethod
+    def maps_across_hosts() -> bool:
+        """Whether the heap reaches peers on other hosts.
+
+        Only gfx1250 maps them, over xGMI, and the heap spans every world rank,
+        so the whole job must share one fabric domain.
+        """
+        if not current_platform().is_cdna5:
+            return False
+        from tokenspeed_kernel.ops.communication.iris import world_shares_fabric_domain
+
+        return world_shares_fabric_domain()
+
+    @staticmethod
+    def heap_available() -> bool:
+        """Whether the heap can be built, even for a node-local group.
+
+        On gfx1250 a job spanning hosts needs one fabric domain for it.
+        """
+        if not current_platform().is_cdna5:
+            return True
+        from tokenspeed_kernel.ops.communication.iris import (
+            world_shares_fabric_domain,
+            world_spans_hosts,
+        )
+
+        return not world_spans_hosts() or world_shares_fabric_domain()
+
     def state(self, group: Group, dtype: torch.dtype) -> "IrisAllReduce | None":
         """Return this group's prepared all-reduce state without allocating."""
         return self._instances.get((group, dtype))
@@ -113,6 +141,8 @@ class IrisBackend(CommBackend):
         """Allocate fixed capacities before cache planning and graph capture."""
         if len(group) <= 1 or not current_platform().is_amd:
             return False
+        if not self.heap_available():
+            return False
         if dtype != torch.bfloat16:
             return False
         staged_max_numel = min(staged_max_numel, self._max_numel)
@@ -134,6 +164,8 @@ class IrisBackend(CommBackend):
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
         """Check ordinary staged eligibility without allocating collective state."""
         if len(group) <= 1 or not current_platform().is_amd:
+            return False
+        if not self.heap_available():
             return False
         state = self.state(group, tensor.dtype)
         max_numel = self._max_numel

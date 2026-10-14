@@ -60,6 +60,8 @@ def backend(monkeypatch):
     instance._iris.producer_direct_max_bytes = 1024 * 1024
     instance._iris.can_acquire_outputs.return_value = True
     instance._iris.can_reduce_outputs.return_value = False
+    instance._iris.maps_across_hosts.return_value = False
+    instance._iris.heap_available.return_value = True
     return instance
 
 
@@ -157,7 +159,7 @@ def test_iris_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     monkeypatch.setattr(
         iris_module,
         "current_platform",
-        lambda: SimpleNamespace(is_amd=True),
+        lambda: SimpleNamespace(is_amd=True, is_cdna5=False),
     )
 
     tensor.numel.return_value = 36 * 7168
@@ -183,7 +185,9 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
         return state
 
     monkeypatch.setattr(
-        iris_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+        iris_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna5=False),
     )
     monkeypatch.setattr(backend, "_create", create)
     capacities = dict(
@@ -194,6 +198,57 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     assert backend.prepare_all_reduce_buffers(group, **capacities)
     assert backend.state(group, torch.bfloat16) is state
     assert len(created) == 1
+
+
+def _set_iris_world(monkeypatch, *, cdna5: bool, spans: bool, shared: bool) -> None:
+    import tokenspeed_kernel.ops.communication.iris as kernel_iris
+
+    monkeypatch.setattr(
+        iris_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
+    )
+    monkeypatch.setattr(kernel_iris, "world_spans_hosts", lambda: spans)
+    monkeypatch.setattr(kernel_iris, "world_shares_fabric_domain", lambda: shared)
+
+
+@pytest.mark.parametrize(
+    ("spans", "shared", "across", "heap"),
+    [
+        (False, False, False, True),
+        (True, True, True, True),
+        (True, False, False, False),
+    ],
+    ids=["one-host", "one-fabric-domain", "no-shared-domain"],
+)
+def test_gfx1250_heap_spans_hosts_only_within_one_fabric_domain(
+    monkeypatch, spans, shared, across, heap
+):
+    """The heap maps every world rank, so a node-local group is no exception."""
+    _set_iris_world(monkeypatch, cdna5=True, spans=spans, shared=shared)
+    backend = IrisBackend(Mock())
+    tensor = Mock(
+        is_cuda=True, is_contiguous=Mock(return_value=True), dtype=torch.bfloat16
+    )
+    tensor.numel.return_value = 1024
+
+    assert backend.maps_across_hosts() is across
+    assert backend.heap_available() is heap
+    assert backend.can_run(tensor, (0, 1)) is heap
+    if not heap:
+        assert not backend.prepare_all_reduce_buffers(
+            (0, 1),
+            staged_max_numel=1024,
+            producer_direct_max_numel=1024,
+            dtype=torch.bfloat16,
+        )
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_gfx950_heap_ignores_the_world_topology(monkeypatch, shared):
+    _set_iris_world(monkeypatch, cdna5=False, spans=True, shared=shared)
+    assert not IrisBackend.maps_across_hosts()
+    assert IrisBackend.heap_available()
 
 
 def test_public_preparation_preserves_capacities(backend, monkeypatch):
