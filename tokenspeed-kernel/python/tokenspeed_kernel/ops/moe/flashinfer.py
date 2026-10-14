@@ -2584,11 +2584,13 @@ if platform.is_nvidia:
         w13_input_scale = w.w13_input_scale.to(torch.float32)
         w2_input_scale = w.w2_input_scale.to(torch.float32)
         w.w13_weight_scale_2 = torch.nn.Parameter(w13_ws2, requires_grad=False)
+        # FlashInfer's CUTLASS MoE takes the activation global scale as a 0-D scalar or one value per
+        # local expert; the checkpoint scale is a single value stored as shape (1,), so pass it as 0-D.
         w.w13_input_scale_quant = torch.nn.Parameter(
-            (1.0 / w13_input_scale).to(torch.float32), requires_grad=False
+            (1.0 / w13_input_scale).to(torch.float32).reshape(()), requires_grad=False
         )
         w.w2_input_scale_quant = torch.nn.Parameter(
-            (1.0 / w2_input_scale).to(torch.float32), requires_grad=False
+            (1.0 / w2_input_scale).to(torch.float32).reshape(()), requires_grad=False
         )
         w.g1_alphas = torch.nn.Parameter(
             (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False

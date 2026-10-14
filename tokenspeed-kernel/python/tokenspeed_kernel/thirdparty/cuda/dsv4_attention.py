@@ -13,9 +13,34 @@ def _objs_dir() -> Path:
     return Path(__file__).resolve().parent / "objs"
 
 
+def _device_arch() -> str:
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major}{minor}"
+
+
+@functools.cache
+def _so_archs(so_path: str) -> frozenset:
+    """Architectures with SASS in a CUDA shared object (needs cuobjdump; empty set if unknown)."""
+    import re
+    import shutil
+    import subprocess
+    tool = shutil.which("cuobjdump") or "/usr/local/cuda/bin/cuobjdump"
+    try:
+        out = subprocess.run([tool, "--list-elf", so_path], capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return frozenset()
+    return frozenset(m.rstrip("a").rstrip("f") for m in re.findall(r"sm_\d+[af]?", out))
+
+
 @functools.cache
 def _load_dsv4_attention_module():
     so_path = _objs_dir() / "dsv4_attention" / "dsv4_attention.so"
+    archs = _so_archs(str(so_path)) if so_path.exists() else frozenset()
+    if archs and torch.cuda.is_available() and _device_arch() not in archs:
+        raise RuntimeError(
+            f"tokenspeed_kernel DeepSeek V4 attention library has no kernels for {_device_arch()} "
+            f"(built for {', '.join(sorted(archs))})"
+        )
     if not so_path.exists():
         raise RuntimeError(
             f"tokenspeed_kernel DeepSeek V4 attention library not found at {so_path}. "
