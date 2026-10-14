@@ -147,6 +147,7 @@ class PLELookup(nn.Module):
         output_dtype: torch.dtype,
         offload: bool,
         prefix: str,
+        mmap_table: bool = False,
     ):
         super().__init__()
         from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -161,6 +162,13 @@ class PLELookup(nn.Module):
             raise ValueError("Unsupported PLE compute dtype")
         if offload and not torch.cuda.is_available():
             raise RuntimeError("PLE host offloading requires CUDA UVA")
+        if mmap_table and not offload:
+            raise ValueError("PLE mmap tables require ple_offload_embedding")
+        if mmap_table and storage_dtype != torch.float8_e4m3fn:
+            raise ValueError("PLE mmap tables require float8_e4m3fn storage")
+        table_group = mapping.attn.world_group if mapping.attn.has_dp else mapping.attn.tp_group
+        if mmap_table and len(table_group) != 1:
+            raise ValueError("PLE mmap tables currently require TP=1")
         self.has_dp = mapping.attn.has_dp
         self.dp_group = mapping.attn.dp_group
         self.dp_rank = self.dp_group.index(mapping.rank)
@@ -174,6 +182,10 @@ class PLELookup(nn.Module):
         self.embed_store_dtype = storage_dtype
         self.embed_output_dtype = output_dtype
         self.offload_embedding = offload
+        self.mmap_table = mmap_table
+        self._mmap_owner = None
+        self._mmap_bases = None
+        self._mmap_rows_per_shard = None
         self._checkpoint_weight_scale = 1.0
         self._gather_stream: torch.cuda.Stream | None = None
         self._pending: PendingLookup | None = None
@@ -188,7 +200,7 @@ class PLELookup(nn.Module):
                 tp_size=len(self.table_group),
                 tp_group=self.table_group,
             )
-        if offload:
+        if offload and not mmap_table:
             materialize_ngram_table_on_host(self.ngram_embedding)
         self._compute_device = (
             torch.device("cuda", torch.cuda.current_device())
@@ -336,6 +348,19 @@ class PLELookup(nn.Module):
         table.
         """
 
+        if self.mmap_table:
+            from tokenspeed.runtime.layers.ple_mmap import ple_mmap_gather
+
+            if self._mmap_owner is None or self._mmap_bases is None:
+                raise RuntimeError("PLE mmap table was not bound to a checkpoint")
+            return ple_mmap_gather(
+                ids.reshape(-1),
+                self._mmap_bases,
+                out,
+                rows_per_shard=self._mmap_rows_per_shard,
+                head_dim=self.head_dim,
+                scale=self._checkpoint_weight_scale,
+            )
         row_scale = self.ngram_embedding_scale
         scale = (
             self._checkpoint_weight_scale
@@ -396,6 +421,19 @@ class PLELookup(nn.Module):
             local_ids = ids.clamp(min=0, max=module.num_embeddings_padded - 1)
         scale = self.ngram_embedding_scale[local_ids]
         return (raw.to(torch.float32) * scale.unsqueeze(-1)).to(self.embed_output_dtype)
+
+    def bind_mmap_table(self, owner, bases, rows_per_shard: int) -> None:
+        if not self.mmap_table:
+            raise RuntimeError(
+                "Cannot bind mmap storage when ple_mmap_table is disabled"
+            )
+        if len(bases) != 128:
+            raise ValueError(f"Expected 128 PLE shards, got {len(bases)}")
+        self._mmap_owner = owner
+        self._mmap_bases = torch.tensor(
+            bases, dtype=torch.int64, device=self._compute_device
+        )
+        self._mmap_rows_per_shard = int(rows_per_shard)
 
     def load_shard(self, loaded_weight, shard_index: int, split_parts: int):
         embedding = self.ngram_embedding

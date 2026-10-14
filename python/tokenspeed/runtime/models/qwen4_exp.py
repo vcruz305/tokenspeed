@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from collections.abc import Iterable
 
@@ -652,6 +654,61 @@ def _load_ple_weight_scale(
     return f"{module_name}.lookup.ngram_embedding.weight"
 
 
+def _bind_ple_mmap_checkpoint(module: nn.Module, checkpoint_dir: str) -> None:
+    """Bind the checkpoint-backed FP8 PLE table without materializing it."""
+    lookups = [
+        item for item in module.modules() if getattr(item, "mmap_table", False)
+    ]
+    if not lookups:
+        return
+    from tokenspeed.runtime.layers.ple_mmap import (
+        open_mmap_table,
+        safetensors_header,
+    )
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        raise FileNotFoundError(
+            f"PLE mmap requires model.safetensors.index.json in {checkpoint_dir}"
+        )
+    with open(index_path, encoding="utf-8") as handle:
+        weight_map = json.load(handle)["weight_map"]
+    matched = {}
+    for name, filename in weight_map.items():
+        match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
+        if match:
+            matched[int(match.group(1))] = (
+                name, os.path.join(checkpoint_dir, filename)
+            )
+    if sorted(matched) != list(range(128)):
+        raise ValueError(
+            f"PLE mmap requires 128 indexed shards, found {len(matched)}"
+        )
+    filenames = {entry[1] for entry in matched.values()}
+    if len(filenames) != 1:
+        raise ValueError(
+            "PLE mmap currently requires all shards in one safetensors file"
+        )
+    path = next(iter(filenames))
+    header, _ = safetensors_header(path)
+    names = [matched[i][0] for i in range(128)]
+    shapes = [tuple(header[name]["shape"]) for name in names]
+    dtypes = {header[name]["dtype"] for name in names}
+    if len(set(shapes)) != 1 or len(shapes[0]) != 2 or dtypes != {"F8_E4M3"}:
+        raise ValueError(
+            f"Unexpected PLE mmap shard shape/dtype: {shapes[:2]}, {dtypes}"
+        )
+    owner, _, bases = open_mmap_table(path, names)
+    rows_per_shard = shapes[0][0]
+    for lookup in lookups:
+        if lookup.ngram_embedding.tp_size != 1:
+            raise ValueError("PLE mmap currently requires TP=1")
+        lookup.bind_mmap_table(owner, bases, rows_per_shard)
+
+
+def _is_ple_shard_weight(name: str) -> bool:
+    return re.search(r"\.ngram_embedding\.shard_\d+\.weight$", name) is not None
+
+
 def load_qwen4_exp_weights(
     module: nn.Module,
     config: Qwen4ExpTextConfig,
@@ -803,6 +860,13 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
             self, self.config, self.mapping, weights, include_visual=False
         )
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        mmap_table = getattr(self.config, "ple_mmap_table", False)
+        return not (mmap_table and _is_ple_shard_weight(name))
+
+    def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
+        _bind_ple_mmap_checkpoint(self, checkpoint_dir)
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         config = getattr(config, "text_config", config)
@@ -846,6 +910,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             weights,
             include_visual=self.is_multimodal_active,
         )
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        config = getattr(self.config, "text_config", self.config)
+        mmap_table = getattr(config, "ple_mmap_table", False)
+        return not (mmap_table and _is_ple_shard_weight(name))
+
+    def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
+        _bind_ple_mmap_checkpoint(self, checkpoint_dir)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

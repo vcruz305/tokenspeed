@@ -196,6 +196,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
             prefix=add_prefix("ngram_embedding", prefix),
+            mmap_table=bool(getattr(config, "ple_mmap_table", False)),
         )
         if self.ple_layer_index == 0 and offload_embedding:
             weight = self.lookup.ngram_embedding.weight
