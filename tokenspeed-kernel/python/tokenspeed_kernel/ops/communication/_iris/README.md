@@ -41,5 +41,6 @@ configure_iris(heap_size=None, allocator_type="torch")
 ```
 
 `heap_size=None` sizes the heap automatically. `allocator_type=None` uses Iris's
-default (`torch` in the pinned version). Names pass through to Iris;
-`IRIS_ALLOCATOR` takes precedence. A live context cannot be reconfigured.
+default (`torch` in the pinned version), except `vmem_chunked` when the job spans
+gfx1250 hosts in one fabric domain. Names pass through to Iris; `IRIS_ALLOCATOR`
+takes precedence. A live context cannot be reconfigured.

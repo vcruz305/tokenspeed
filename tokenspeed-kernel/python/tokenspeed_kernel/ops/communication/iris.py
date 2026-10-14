@@ -55,8 +55,10 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
 
     Args:
         heap_size: Initial heap capacity in bytes, or None for automatic sizing.
-        allocator_type: Iris allocator name, or None for Iris's default. Iris's
-            ``IRIS_ALLOCATOR`` environment override retains its normal precedence.
+        allocator_type: Iris allocator name, or None for Iris's default, except
+            ``vmem_chunked`` when the job spans gfx1250 hosts in one fabric
+            domain. Iris's ``IRIS_ALLOCATOR`` environment override retains its
+            normal precedence.
     """
     from tokenspeed_kernel.ops.communication._iris import configure_iris as configure
 

@@ -144,6 +144,34 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("topology", "configured", "expected"),
+    [
+        (None, None, {}),
+        ((1, False), None, {}),
+        ((2, True), None, {"allocator_type": "vmem_chunked"}),
+        ((2, False), None, {}),
+        ((2, True), "torch", {"allocator_type": "torch"}),
+    ],
+    ids=["undiscovered", "one-host", "one-fabric-domain", "two-domains", "configured"],
+)
+def test_context_spanning_one_fabric_domain_uses_the_fabric_allocator(
+    monkeypatch, topology, configured, expected
+):
+    from tokenspeed_kernel.ops.communication import _iris
+
+    created = []
+    monkeypatch.setattr(_iris, "_world_topology", topology)
+    monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_allocator_type", configured)
+    monkeypatch.setattr(
+        _iris.iris, "iris", lambda **options: created.append(options) or "ctx"
+    )
+
+    assert _iris.get_or_create_context(heap_size=1 << 20) == "ctx"
+    assert created == [{"heap_size": 1 << 20, **expected}]
+
+
+@pytest.mark.parametrize(
     ("placement", "spans", "shared"),
     [
         ([("a", "p:1")] * 2, False, False),
