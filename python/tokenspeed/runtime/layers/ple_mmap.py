@@ -70,33 +70,35 @@ def _ple_mmap_gather_kernel(
     ids_ptr,
     bases_ptr,
     out_ptr,
-    n_rows,
     scale,
     rows_per_shard: tl.constexpr,
     num_shards: tl.constexpr,
     head_dim: tl.constexpr,
-    BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # n_rows and scale are runtime values: one compiled kernel serves every batch/prefill size.
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    dim = tl.arange(0, BLOCK_D)
-    logical_id = tl.load(ids_ptr + row, row < n_rows, other=0)
+    """One n-gram row per program, read straight from the file-backed mapping.
+
+    Same addressing as TokenSpeed's ``_ple_host_gather_kernel``: the shard base is a host virtual
+    address (valid on the device under ATS / unified addressing), cast once as a scalar to an FP8
+    pointer, plus row and column offsets. ``scale`` is the checkpoint's per-tensor dequant factor,
+    applied exactly as the pinned-host FP8 path applies it.
+    """
+    row = tl.program_id(0)
+    logical_id = tl.load(ids_ptr + row)
     valid = (logical_id >= 0) & (logical_id < rows_per_shard * num_shards)
-    shard = logical_id // rows_per_shard
-    local = logical_id % rows_per_shard
-    address = tl.load(bases_ptr + shard, (row < n_rows) & valid, other=0)
-    table = tl.cast(address, tl.pointer_type(tl.float8e4nv))
-    values = tl.load(
-        table + local[:, None] * head_dim + dim[None, :],
-        (row[:, None] < n_rows) & valid[:, None] & (dim[None, :] < head_dim),
-        other=0,
-    )
-    result = values.to(tl.float32) * scale
+    safe_id = tl.where(valid, logical_id, 0)
+    shard = safe_id // rows_per_shard
+    local = safe_id % rows_per_shard
+    base = tl.load(bases_ptr + shard)
+    table = base.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < head_dim
+    values = tl.load(table + local * head_dim + offsets, mask=mask & valid, other=0.0).to(tl.float32)
+    values = values * scale
     tl.store(
-        out_ptr + row[:, None] * head_dim + dim[None, :],
-        result,
-        (row[:, None] < n_rows) & valid[:, None] & (dim[None, :] < head_dim),
+        out_ptr + row * head_dim + offsets,
+        tl.where(valid, values, 0.0).to(out_ptr.dtype.element_ty),
+        mask=mask,
     )
 
 
@@ -105,10 +107,10 @@ def ple_mmap_gather(ids, bases, out, *, rows_per_shard, head_dim, scale):
     rows = ids.numel()
     if rows == 0:
         return out
-    _ple_mmap_gather_kernel[(triton.cdiv(rows, 4),)](
-        ids, bases, out, rows, float(scale),
+    _ple_mmap_gather_kernel[(rows,)](
+        ids, bases, out, float(scale),
         rows_per_shard=int(rows_per_shard), num_shards=int(bases.numel()), head_dim=int(head_dim),
-        BLOCK=4, BLOCK_D=triton.next_power_of_2(int(head_dim)),
-        num_warps=4,
+        BLOCK_D=triton.next_power_of_2(int(head_dim)),
+        num_warps=1,
     )
     return out
