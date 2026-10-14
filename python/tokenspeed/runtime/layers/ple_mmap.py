@@ -70,16 +70,19 @@ def _ple_mmap_gather_kernel(
     ids_ptr,
     bases_ptr,
     out_ptr,
-    n_rows: tl.constexpr,
+    n_rows,
+    scale,
     rows_per_shard: tl.constexpr,
+    num_shards: tl.constexpr,
     head_dim: tl.constexpr,
-    scale: tl.constexpr,
     BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
+    # n_rows and scale are runtime values: one compiled kernel serves every batch/prefill size.
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    dim = tl.arange(0, triton.next_power_of_2(head_dim))
+    dim = tl.arange(0, BLOCK_D)
     logical_id = tl.load(ids_ptr + row, row < n_rows, other=0)
-    valid = logical_id < rows_per_shard * 128
+    valid = (logical_id >= 0) & (logical_id < rows_per_shard * num_shards)
     shard = logical_id // rows_per_shard
     local = logical_id % rows_per_shard
     address = tl.load(bases_ptr + shard, (row < n_rows) & valid, other=0)
@@ -103,7 +106,9 @@ def ple_mmap_gather(ids, bases, out, *, rows_per_shard, head_dim, scale):
     if rows == 0:
         return out
     _ple_mmap_gather_kernel[(triton.cdiv(rows, 4),)](
-        ids, bases, out, rows, rows_per_shard, head_dim, float(scale), 4,
+        ids, bases, out, rows, float(scale),
+        rows_per_shard=int(rows_per_shard), num_shards=int(bases.numel()), head_dim=int(head_dim),
+        BLOCK=4, BLOCK_D=triton.next_power_of_2(int(head_dim)),
         num_warps=4,
     )
     return out
